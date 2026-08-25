@@ -303,3 +303,124 @@ describe("list_unread", () => {
     assert.equal(captured["X-Auth-Token"], "test-token");
   });
 });
+
+/**
+ * The bulk path. Every test above mocks only subscriptions.getOne, so they
+ * exercise the fallback — which is exactly what should still happen on an
+ * instance without the bulk endpoint. These cover the fast path.
+ */
+describe("list_unread — bulk subscriptions.get", () => {
+  /** Same fixtures as the fan-out tests, served from one endpoint. */
+  function bulkFetcher(opts: { trackCalls?: string[] } = {}): Fetcher {
+    return async (raw) => {
+      const url = new URL(String(raw));
+      opts.trackCalls?.push(url.pathname);
+      if (url.pathname === "/api/v1/channels.list.joined") return jsonResponse(CHANNELS);
+      if (url.pathname === "/api/v1/groups.list") return jsonResponse(GROUPS);
+      if (url.pathname === "/api/v1/im.list") return jsonResponse(IMS);
+      if (url.pathname === "/api/v1/subscriptions.get") {
+        return jsonResponse({
+          update: Object.entries(SUBS).map(([rid, sub]) => ({
+            rid,
+            unread: sub.unread,
+            userMentions: sub.userMentions,
+            alert: sub.alert ?? false,
+          })),
+          remove: [],
+          success: true,
+        });
+      }
+      return jsonResponse({ success: false, error: "no mock for " + url.pathname }, 500);
+    };
+  }
+
+  it("reads every subscription in one call and never touches subscriptions.getOne", async () => {
+    const calls: string[] = [];
+    const out = await listUnread(clientWith(bulkFetcher({ trackCalls: calls })), {});
+
+    assert.equal(
+      calls.filter((c) => c === "/api/v1/subscriptions.get").length,
+      1,
+      "exactly one bulk call"
+    );
+    assert.equal(
+      calls.filter((c) => c === "/api/v1/subscriptions.getOne").length,
+      0,
+      "the per-room fan-out must not run when the bulk call succeeds"
+    );
+    // Identical result to the fan-out: c-noise filtered, rest by lastMessage desc.
+    assert.deepEqual(
+      out.rooms.map((r) => r.room_id),
+      ["d-mention", "p-unread", "c-mention"]
+    );
+  });
+
+  it("falls back to the per-room fan-out when the bulk endpoint 404s", async () => {
+    const calls: string[] = [];
+    const base = buildFetcher({ trackCalls: calls });
+    const fetcher: Fetcher = async (raw, init) => {
+      const url = new URL(String(raw));
+      if (url.pathname === "/api/v1/subscriptions.get") {
+        calls.push(url.pathname);
+        return jsonResponse({ success: false, error: "unknown endpoint" }, 404);
+      }
+      return base(raw, init);
+    };
+
+    const out = await listUnread(clientWith(fetcher), {});
+    assert.ok(calls.includes("/api/v1/subscriptions.get"), "bulk is tried first");
+    assert.equal(
+      calls.filter((c) => c.startsWith("/api/v1/subscriptions.getOne")).length,
+      4,
+      "all four rooms fall back to getOne"
+    );
+    assert.deepEqual(
+      out.rooms.map((r) => r.room_id),
+      ["d-mention", "p-unread", "c-mention"]
+    );
+  });
+
+  it("falls back rather than reporting no unread when the bulk call answers 200 with no update array", async () => {
+    const calls: string[] = [];
+    const base = buildFetcher({ trackCalls: calls });
+    const fetcher: Fetcher = async (raw, init) => {
+      const url = new URL(String(raw));
+      if (url.pathname === "/api/v1/subscriptions.get") {
+        calls.push(url.pathname);
+        return jsonResponse({ success: true });
+      }
+      return base(raw, init);
+    };
+
+    const out = await listUnread(clientWith(fetcher), {});
+    // The dangerous failure this guards: an empty map read as "nothing unread".
+    assert.equal(out.rooms.length, 3);
+    assert.equal(
+      calls.filter((c) => c.startsWith("/api/v1/subscriptions.getOne")).length,
+      4
+    );
+  });
+
+  it("ignores subscriptions for rooms that are not in the room list", async () => {
+    const fetcher: Fetcher = async (raw) => {
+      const url = new URL(String(raw));
+      if (url.pathname === "/api/v1/channels.list.joined") return jsonResponse(CHANNELS);
+      if (url.pathname === "/api/v1/groups.list") return jsonResponse({ groups: [], total: 0, success: true });
+      if (url.pathname === "/api/v1/im.list") return jsonResponse({ ims: [], total: 0, success: true });
+      if (url.pathname === "/api/v1/subscriptions.get") {
+        return jsonResponse({
+          update: [
+            { rid: "c-mention", unread: 0, userMentions: 2, alert: true },
+            // A room the user is subscribed to but which no list endpoint
+            // returned — it must not appear as a phantom row.
+            { rid: "ghost-room", unread: 9, userMentions: 9, alert: true },
+          ],
+          success: true,
+        });
+      }
+      return jsonResponse({}, 500);
+    };
+    const out = await listUnread(clientWith(fetcher), {});
+    assert.deepEqual(out.rooms.map((r) => r.room_id), ["c-mention"]);
+  });
+});

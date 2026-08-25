@@ -25,9 +25,7 @@ export const listUnreadDescription =
   "Use list_my_rooms instead if you want to see all rooms regardless of unread state. " +
   "Returns one entry per room with room_id, room_type ('c'=channel, 'p'=private group, 'd'=direct message), " +
   "name, unread_count, mention_count, manually_marked_unread (true if you marked the room unread but there are no new messages), " +
-  "last_message_at, last_message_preview. Sorted by last_message_at desc. " +
-  "First call may take a few seconds: this server's Rocket.Chat does not expose a bulk subscriptions endpoint, " +
-  "so per-room metadata is fetched in parallel.";
+  "last_message_at, last_message_preview. Sorted by last_message_at desc.";
 
 export async function listUnread(
   client: RocketChatClient,

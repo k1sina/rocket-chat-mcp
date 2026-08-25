@@ -154,9 +154,9 @@ Rooms with unread messages, mentions, or that you've manually marked unread. Use
 }
 ```
 
-Sorted by `last_message_at` desc. **First call may take a few seconds** — see [Architecture: caching](#architecture).
+Sorted by `last_message_at` desc.
 
-**Endpoints called:** `channels.list.joined`, `groups.list`, `im.list`, then `subscriptions.getOne` per room.
+**Endpoints called:** `channels.list.joined`, `groups.list`, `im.list`, then `subscriptions.get` once for the whole account (falling back to `subscriptions.getOne` per room — see [Architecture](#architecture)).
 
 ### `list_my_rooms`
 
@@ -167,7 +167,7 @@ All rooms you're subscribed to. Use this to **look up a `room_id` by name**.
 | `type` | `"channel" \| "private" \| "dm" \| "all"` | `"all"` | Filter by room type. |
 | `limit` | `integer 1..500` | `100` | Maximum number of rooms to return. |
 
-**Output:** same shape as `list_unread` but **without** `unread_count` / `mention_count` (skipping the per-room `subscriptions.getOne` fan-out makes this cheap). Sorted by `last_message_at` desc.
+**Output:** same shape as `list_unread` but **without** `unread_count` / `mention_count` (it reads no subscription data at all). Sorted by `last_message_at` desc.
 
 **Endpoints called:** `channels.list.joined`, `groups.list`, `im.list`.
 
@@ -278,8 +278,9 @@ Every call also writes a `[WRITE] chat.postMessage {...}` line to stderr regardl
 - **Transport.** stdio (`@modelcontextprotocol/sdk`'s `StdioServerTransport`). The server name is `rocket-chat-mcp`, version mirrors `package.json`.
 - **Self-test on startup.** On launch the server calls `GET /api/v1/me` and prints `Connected as @<username>` to stderr, or exits non-zero with a diagnostic if it can't.
 - **Room-type cache.** Per-session, in-memory map of `room_id → "c"|"p"|"d"`. Primed by `list_my_rooms` / `list_unread`, so subsequent `get_room_history` / `post_message` calls don't re-query `rooms.info`.
-- **Subscription-map cache.** `list_unread` fans out to `subscriptions.getOne` per room. The result is cached for **60 seconds** so repeat calls in the same session are free.
-- **Concurrency.** The `subscriptions.getOne` fan-out is concurrency-limited to **4 in-flight requests** to stay within typical Rocket.Chat per-endpoint rate limits.
+- **Unread data comes from one request.** `list_unread` calls `subscriptions.get`, which returns every subscription for the authenticated user. An earlier version looked for `subscriptions.getAll`, concluded the endpoint did not exist, and fanned out `subscriptions.getOne` per room instead — on a 59-room account that cost **~17s** against **~0.26s** for the bulk call.
+- **Per-room fallback.** If `subscriptions.get` errors, or answers `200` without an `update` array, the per-room fan-out runs instead, concurrency-limited to **4 in-flight requests** to stay within typical Rocket.Chat per-endpoint rate limits. Falling back matters more than it looks: reading an empty bulk response as "nothing unread" would hide real messages rather than fail loudly.
+- **Subscription-map cache.** Whichever path ran, the result is cached for **60 seconds** so repeat calls in the same session are free.
 - **429 handling.** On `429 Too Many Requests`, the client parses the "wait X seconds" hint from the response body, sleeps for `min(X, 5s)`, and retries **once**. After that it gives up gracefully (the affected room is reported with whatever metadata is available; the tool does not error out).
 - **Manual "Mark as Unread".** Rocket.Chat sets `alert: true` while leaving `unread: 0` for rooms you marked unread without new messages. `list_unread` includes both signals; rooms in this state are flagged with `manually_marked_unread: true`.
 

@@ -1,10 +1,15 @@
 import type { RocketChatClient, RoomType } from "../rocketchat-client.js";
 import { RocketChatApiError } from "../rocketchat-client.js";
 
-// Some Rocket.Chat instances do not expose subscriptions.getAll. We assemble
-// the room list from the three per-type endpoints, and pull unread/mentions
-// data on demand from subscriptions.getOne (one call per room,
-// concurrency-limited).
+// The room list is assembled from the three per-type endpoints.
+//
+// Unread/mention data comes from subscriptions.get — ONE call returning every
+// subscription for the authenticated user. An earlier version of this file
+// claimed the endpoint did not exist and fanned out subscriptions.getOne per
+// room instead; the endpoint it looked for was subscriptions.getAll, which is
+// not what Rocket.Chat calls it. On a 59-room account the fan-out took ~17s
+// against ~0.26s for the bulk call. The fan-out is kept as a fallback for
+// instances that really do refuse the bulk endpoint.
 
 const PAGE_SIZE = 100;
 
@@ -138,21 +143,77 @@ export interface SubscriptionData {
   ls?: string;
 }
 
+interface SubscriptionDoc {
+  rid?: string;
+  unread?: number;
+  userMentions?: number;
+  groupMentions?: number;
+  alert?: boolean;
+  ls?: string;
+}
+
 interface SubscriptionResponse {
-  subscription?: {
-    unread?: number;
-    userMentions?: number;
-    groupMentions?: number;
-    alert?: boolean;
-    ls?: string;
+  subscription?: SubscriptionDoc;
+}
+
+interface SubscriptionsGetResponse {
+  update?: SubscriptionDoc[];
+  remove?: SubscriptionDoc[];
+}
+
+function toSubscriptionData(sub: SubscriptionDoc): SubscriptionData {
+  return {
+    unread: sub.unread ?? 0,
+    userMentions: sub.userMentions ?? 0,
+    groupMentions: sub.groupMentions ?? 0,
+    alert: sub.alert ?? false,
+    ls: sub.ls,
   };
 }
 
-// Rocket.Chat rate-limits subscriptions.getOne at roughly 50 req / 60s on
-// some instances. With 50+ rooms a single fan-out can blow the budget, then
-// for the next minute every call comes back 429 and the tool reports "no
-// unread" even when there is. Cache the result of one fan-out for a short
-// window so repeat calls in the same session don't re-fetch.
+/**
+ * Every subscription for the authenticated user, in one request.
+ *
+ * Returns null — never throws — when the instance does not answer, so the
+ * caller falls back to the per-room fan-out. A missing bulk endpoint is a
+ * reason to take the slow path, not to report "no unread" when there is.
+ */
+async function fetchAllSubscriptions(
+  client: RocketChatClient
+): Promise<Map<string, SubscriptionData> | null> {
+  try {
+    const res = await client.request<SubscriptionsGetResponse>(
+      "GET",
+      "/api/v1/subscriptions.get"
+    );
+    const docs = res.update;
+    // An instance that answers 200 with no `update` array is not one we can
+    // read subscriptions from; treat it as unsupported rather than as "the
+    // user has no subscriptions", which would silently blank every unread.
+    if (!Array.isArray(docs)) return null;
+
+    const map = new Map<string, SubscriptionData>();
+    for (const doc of docs) {
+      if (typeof doc.rid !== "string") continue;
+      map.set(doc.rid, toSubscriptionData(doc));
+    }
+    return map;
+  } catch (err) {
+    if (err instanceof Error) {
+      console.error(`[rc] subscriptions.get unavailable, falling back to per-room: ${err.message}`);
+    }
+    return null;
+  }
+}
+
+// Short-lived cache over whichever path ran.
+//
+// It matters most on the fallback: Rocket.Chat rate-limits subscriptions.getOne
+// at roughly 50 req / 60s on some instances, so with 50+ rooms one fan-out can
+// blow the budget and every call for the next minute comes back 429 — reporting
+// "no unread" when there is. On the bulk path it is only saving a ~0.26s call,
+// which is why the TTL below is short enough that a caller polling on its own
+// schedule still sees new messages promptly.
 let subscriptionMapCache: {
   fetchedAt: number;
   roomIds: string;
@@ -183,13 +244,7 @@ async function fetchOneSubscription(
       );
       const sub = res.subscription;
       if (!sub) return null;
-      return {
-        unread: sub.unread ?? 0,
-        userMentions: sub.userMentions ?? 0,
-        groupMentions: sub.groupMentions ?? 0,
-        alert: sub.alert ?? false,
-        ls: sub.ls,
-      };
+      return toSubscriptionData(sub);
     } catch (err) {
       if (err instanceof RocketChatApiError && err.status === 404) {
         return null;
@@ -230,18 +285,30 @@ export async function fetchSubscriptionMap(
   }
 
   const out = new Map<string, SubscriptionData>();
-  let i = 0;
-  async function worker(): Promise<void> {
-    while (true) {
-      const idx = i++;
-      if (idx >= roomIds.length) return;
-      const rid = roomIds[idx]!;
-      const sub = await fetchOneSubscription(client, rid);
+
+  // One request for the whole account. Filtered down to the rooms asked for,
+  // so the cached map matches the cache key above and the fallback below
+  // returns the same shape.
+  const bulk = await fetchAllSubscriptions(client);
+  if (bulk) {
+    for (const rid of roomIds) {
+      const sub = bulk.get(rid);
       if (sub) out.set(rid, sub);
     }
+  } else {
+    let i = 0;
+    async function worker(): Promise<void> {
+      while (true) {
+        const idx = i++;
+        if (idx >= roomIds.length) return;
+        const rid = roomIds[idx]!;
+        const sub = await fetchOneSubscription(client, rid);
+        if (sub) out.set(rid, sub);
+      }
+    }
+    const workerCount = Math.min(concurrency, roomIds.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
   }
-  const workerCount = Math.min(concurrency, roomIds.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   if (useCache) {
     subscriptionMapCache = { fetchedAt: Date.now(), roomIds: cacheKey, map: out };

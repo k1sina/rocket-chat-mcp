@@ -1,37 +1,10 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { RocketChatClient } from "./rocketchat-client.js";
-import {
-  listUnread,
-  listUnreadDescription,
-  listUnreadInputShape,
-} from "./tools/list-unread.js";
-import {
-  listMyRooms,
-  listMyRoomsDescription,
-  listMyRoomsInputShape,
-} from "./tools/list-my-rooms.js";
-import {
-  getRoomHistory,
-  getRoomHistoryDescription,
-  getRoomHistoryInputShape,
-} from "./tools/get-room-history.js";
-import {
-  searchMessages,
-  searchMessagesDescription,
-  searchMessagesInputShape,
-} from "./tools/search-messages.js";
-import {
-  getUser,
-  getUserDescription,
-  getUserInputShape,
-} from "./tools/get-user.js";
-import {
-  postMessage,
-  postMessageDescription,
-  postMessageInputShape,
-} from "./tools/post-message.js";
+import { isHttpTransport, loadHttpOptions, startHttpServer } from "./http.js";
+import { createServer, SERVER_NAME } from "./server.js";
+
+const DEFAULT_HTTP_PORT = 8702;
 
 function readEnv(): { url: string; debug: boolean } {
   const url = process.env.ROCKETCHAT_URL?.trim();
@@ -59,89 +32,35 @@ function readEnv(): { url: string; debug: boolean } {
 
 async function main(): Promise<void> {
   const { url, debug } = readEnv();
+  // Validate transport settings before any network call, so a typo fails fast.
+  const http = isHttpTransport() ? loadHttpOptions(process.env, DEFAULT_HTTP_PORT) : undefined;
   const client = new RocketChatClient(url, { debug });
 
+  let username: string;
   try {
-    const me = await client.selfTest();
-    console.error(`[rocket-chat-mcp] Connected as @${me.username} (${url})`);
+    ({ username } = await client.selfTest());
+    console.error(`[${SERVER_NAME}] Connected as @${username} (${url})`);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.error(`[rocket-chat-mcp] Startup self-test failed: ${reason}`);
+    console.error(`[${SERVER_NAME}] Startup self-test failed: ${reason}`);
     process.exit(1);
   }
 
-  const server = new McpServer({
-    name: "rocket-chat-mcp",
-    version: "0.1.0",
-  });
-
-  function ok<T>(data: T) {
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
-    };
+  if (http) {
+    await startHttpServer(SERVER_NAME, () => createServer(client), http);
+    console.error(
+      `[${SERVER_NAME}] Listening on http://${http.host}:${http.port}/mcp as @${username}` +
+        `${http.token ? "" : " (no MCP_HTTP_TOKEN: loopback only)"}`,
+    );
+    return;
   }
 
-  server.registerTool(
-    "list_unread",
-    {
-      description: listUnreadDescription,
-      inputSchema: listUnreadInputShape,
-    },
-    async (input) => ok(await listUnread(client, input))
-  );
-
-  server.registerTool(
-    "list_my_rooms",
-    {
-      description: listMyRoomsDescription,
-      inputSchema: listMyRoomsInputShape,
-    },
-    async (input) => ok(await listMyRooms(client, input))
-  );
-
-  server.registerTool(
-    "get_room_history",
-    {
-      description: getRoomHistoryDescription,
-      inputSchema: getRoomHistoryInputShape,
-    },
-    async (input) => ok(await getRoomHistory(client, input))
-  );
-
-  server.registerTool(
-    "search_messages",
-    {
-      description: searchMessagesDescription,
-      inputSchema: searchMessagesInputShape,
-    },
-    async (input) => ok(await searchMessages(client, input))
-  );
-
-  server.registerTool(
-    "get_user",
-    {
-      description: getUserDescription,
-      inputSchema: getUserInputShape,
-    },
-    async (input) => ok(await getUser(client, input))
-  );
-
-  server.registerTool(
-    "post_message",
-    {
-      description: postMessageDescription,
-      inputSchema: postMessageInputShape,
-    },
-    async (input) => ok(await postMessage(client, input))
-  );
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("[rocket-chat-mcp] Listening on stdio.");
+  await createServer(client).connect(new StdioServerTransport());
+  console.error(`[${SERVER_NAME}] Listening on stdio.`);
 }
 
 main().catch((err: unknown) => {
   const reason = err instanceof Error ? err.stack ?? err.message : String(err);
-  console.error(`[rocket-chat-mcp] Fatal: ${reason}`);
+  console.error(`[${SERVER_NAME}] Fatal: ${reason}`);
   process.exit(1);
 });

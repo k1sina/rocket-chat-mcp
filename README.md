@@ -4,12 +4,12 @@
 [![license](https://img.shields.io/npm/l/rocket-chat-mcp.svg)](LICENSE)
 [![node](https://img.shields.io/node/v/rocket-chat-mcp.svg)](https://nodejs.org)
 
-MCP server for self-hosted [Rocket.Chat](https://rocket.chat). Connects to any instance via env-var configuration; no hostname is hard-coded. Six tools — five read, one write — exposed over stdio for [Claude Code](https://docs.claude.com/en/docs/claude-code), [Claude Desktop](https://claude.ai/download), [MCP Inspector](https://github.com/modelcontextprotocol/inspector), or any MCP-aware client.
+MCP server for self-hosted [Rocket.Chat](https://rocket.chat). Connects to any instance via env-var configuration; no hostname is hard-coded. Six tools — five read, one write — exposed over stdio (or Streamable HTTP, see [HTTP mode](#http-mode)) for [Claude Code](https://docs.claude.com/en/docs/claude-code), [Claude Desktop](https://claude.ai/download), [MCP Inspector](https://github.com/modelcontextprotocol/inspector), or any MCP-aware client.
 
 - **Read tools**: `list_unread`, `list_my_rooms`, `get_room_history`, `search_messages`, `get_user`
 - **Write tool**: `post_message`
 - **Auth**: Personal Access Token (`X-User-Id` + `X-Auth-Token` headers)
-- **Transport**: stdio
+- **Transport**: stdio (default) or stateless Streamable HTTP
 - **Runtime**: Node.js 20+, zero non-JS dependencies
 
 ## Requirements
@@ -123,6 +123,28 @@ Opens a browser UI where you can invoke each tool with arbitrary arguments.
 
 ```sh
 ROCKETCHAT_URL=... ROCKETCHAT_USER_ID=... ROCKETCHAT_AUTH_TOKEN=... npx -y rocket-chat-mcp
+```
+
+### HTTP mode
+
+stdio is the default. Set `MCP_TRANSPORT=http` to serve MCP over Streamable HTTP instead, for hosting behind an authenticating gateway:
+
+```sh
+MCP_TRANSPORT=http MCP_HTTP_TOKEN=$(openssl rand -hex 32) ROCKETCHAT_URL=... ROCKETCHAT_USER_ID=... ROCKETCHAT_AUTH_TOKEN=... node dist/index.js
+# [rocket-chat-mcp] Listening on http://127.0.0.1:8702/mcp as @you
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http`. Anything else is a startup error. |
+| `MCP_HTTP_HOST` | `127.0.0.1` | Interface to bind. A non-loopback address requires `MCP_HTTP_TOKEN`. |
+| `MCP_HTTP_PORT` | `8702` | |
+| `MCP_HTTP_TOKEN` | (none) | At least 32 characters. When set, every `/mcp` request must send `Authorization: Bearer <token>`. Without it the server binds loopback only and rejects requests whose `Host` header is not loopback (DNS-rebinding guard). |
+
+The endpoint is `POST /mcp`. It is stateless: a fresh MCP server per request, JSON responses, no sessions, so `GET` and `DELETE` return 405. The Rocket.Chat client, its room-type cache and the 60-second subscription cache are shared across requests, and the startup self-test still runs once. `GET /healthz` returns `{"ok":true}` without auth.
+
+```sh
+claude mcp add --transport http rocket-chat http://127.0.0.1:8702/mcp --header "Authorization: Bearer <token>"
 ```
 
 ## Tools
@@ -275,9 +297,9 @@ Every call also writes a `[WRITE] chat.postMessage {...}` line to stderr regardl
 ## Architecture
 
 - **Auth.** Every request carries `X-User-Id` and `X-Auth-Token` headers, read from env vars at request time. No token is ever logged or echoed in error messages.
-- **Transport.** stdio (`@modelcontextprotocol/sdk`'s `StdioServerTransport`). The server name is `rocket-chat-mcp`, version mirrors `package.json`.
+- **Transport.** stdio (`StdioServerTransport`) by default; `MCP_TRANSPORT=http` switches to stateless Streamable HTTP (`src/http.ts`, shared verbatim with the other MCP servers behind the gateway). `src/server.ts` builds the `McpServer`; `src/index.ts` picks the transport. The server name is `rocket-chat-mcp`, version mirrors `package.json`.
 - **Self-test on startup.** On launch the server calls `GET /api/v1/me` and prints `Connected as @<username>` to stderr, or exits non-zero with a diagnostic if it can't.
-- **Room-type cache.** Per-session, in-memory map of `room_id → "c"|"p"|"d"`. Primed by `list_my_rooms` / `list_unread`, so subsequent `get_room_history` / `post_message` calls don't re-query `rooms.info`.
+- **Room-type cache.** Per-process, in-memory map of `room_id → "c"|"p"|"d"`. Primed by `list_my_rooms` / `list_unread`, so subsequent `get_room_history` / `post_message` calls don't re-query `rooms.info`.
 - **Unread data comes from one request.** `list_unread` calls `subscriptions.get`, which returns every subscription for the authenticated user. An earlier version looked for `subscriptions.getAll`, concluded the endpoint did not exist, and fanned out `subscriptions.getOne` per room instead — on a 59-room account that cost **~17s** against **~0.26s** for the bulk call.
 - **Per-room fallback.** If `subscriptions.get` errors, or answers `200` without an `update` array, the per-room fan-out runs instead, concurrency-limited to **4 in-flight requests** to stay within typical Rocket.Chat per-endpoint rate limits. Falling back matters more than it looks: reading an empty bulk response as "nothing unread" would hide real messages rather than fail loudly.
 - **Subscription-map cache.** Whichever path ran, the result is cached for **60 seconds** so repeat calls in the same session are free.
